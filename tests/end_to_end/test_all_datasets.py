@@ -16,10 +16,12 @@ import asyncio
 import logging
 import os
 import pathlib
-from collections.abc import Callable, Mapping
+import re
+from collections import Counter, defaultdict
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING
 
 import pytest
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -44,8 +46,11 @@ from pyrit.datasets.seed_datasets.remote import (
     _VLSUMultimodalDataset,
     _WildGuardMixDataset,
 )
-from pyrit.models import SeedDataset
+from pyrit.models import SeedDataset, SeedObjective, SeedPrompt
 from pyrit.setup import IN_MEMORY, initialize_pyrit_async
+
+if TYPE_CHECKING:
+    from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
@@ -89,37 +94,19 @@ def get_dataset_providers():
     return [(name, cls) for name, cls in providers.items()]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class _VariantCase:
-    """One non-default provider configuration to validate against real upstream.
+    """A non-default provider configuration and its independent upstream contract."""
 
-    ``test_fetch_dataset`` above builds every provider with no arguments, so it only
-    ever sees each loader's default URL, split or subset. These cases carry the
-    constructor argument that selects a different upstream artifact, plus what that
-    choice should be observable as once the fetch returns.
-    """
-
-    factory: Callable[[], Any]
-    provider_cls: type
-    # Substring the provider's resolved upstream URL must contain, for loaders that
-    # pin the variant in ``source`` before fetching. None when the loader selects the
-    # variant by split or subset instead.
+    factory: Callable[[], SeedDatasetProvider]
+    provider_cls: type[SeedDatasetProvider]
+    dataset_name: str
+    seed_type: type[SeedPrompt] | type[SeedObjective] = SeedPrompt
     source_contains: str | None = None
-    # Metadata every seed must carry, for loaders that record which variant produced it.
-    seed_metadata: Mapping[str, Any] = field(default_factory=dict)
-    # Seed ``data_type`` values the variant must produce, and nothing else.
+    seed_metadata: Mapping[str, object] = field(default_factory=dict)
     expected_data_types: frozenset[str] = frozenset({"text"})
-    # Minimum fraction of seeds that must contain a non-ASCII character. This is the
-    # only binding to the artifact the server actually returned for loaders that select
-    # a variant by split: they record the *requested* variant in seed metadata, so a
-    # split that silently serves the default still reports the requested one. Measured
-    # 2026-09-16: CatQA is 1.000 on zh and vi against 0.000 on the default en.
-    min_non_ascii_fraction: float | None = None
-    # Whether a seed resolving to the OTHER harm category counts as drift. True where
-    # the variant currently maps every upstream category to a specific one, so an
-    # upstream rename is the only way OTHER appears. False where the upstream
-    # taxonomy has a real "other" bucket of its own.
-    forbid_other_harm_category: bool = True
+    text_pattern: str | None = None
+    vlguard_instruction_key: str | None = None
 
 
 # Each case names the exact non-default artifact. A case that starts returning the
@@ -130,19 +117,35 @@ _VARIANT_CASES: dict[str, _VariantCase] = {
         f"aya-{language.lower()}": _VariantCase(
             factory=partial(_AyaRedteamingDataset, language=language),
             provider_cls=_AyaRedteamingDataset,
-            source_contains=f"aya_{_AyaRedteamingDataset.LANGUAGE_CODES[language]}.jsonl",
+            dataset_name="aya_redteaming",
+            source_contains=f"aya_{code}.jsonl",
         )
-        for language in ("Hindi", "French", "Spanish", "Arabic", "Russian", "Serbian", "Tagalog")
+        for language, code in (
+            ("Hindi", "hin"),
+            ("French", "fra"),
+            ("Spanish", "spa"),
+            ("Arabic", "arb"),
+            ("Russian", "rus"),
+            ("Serbian", "srp"),
+            ("Tagalog", "tgl"),
+        )
     },
     # CatQA selects a Hugging Face split and records it on every seed; only "en" is default.
     **{
         f"categorical-harmful-qa-{language}": _VariantCase(
             factory=partial(_CategoricalHarmfulQADataset, language=language),
             provider_cls=_CategoricalHarmfulQADataset,
+            dataset_name="categorical_harmful_qa",
+            seed_type=SeedObjective,
             seed_metadata={"language": language},
-            min_non_ascii_fraction=0.9,
+            text_pattern=pattern,
         )
-        for language in ("zh", "vi")
+        # Han characters versus Vietnamese-specific letters, not just non-ASCII punctuation.
+        # Each pattern matches all 550 rows of its own split and none of the other two (2026-09-28).
+        for language, pattern in (
+            ("zh", r"[\u3400-\u4dbf\u4e00-\u9fff]"),
+            ("vi", r"[\u0102\u0103\u0110\u0111\u01a0\u01a1\u01af\u01b0\u1ea0-\u1ef9]"),
+        )
     },
     # Each VLGuard subset reads a different `instr-resp` field and a different image
     # contract; only UNSAFES is default. Gated, so this runs only with a token whose
@@ -151,15 +154,131 @@ _VARIANT_CASES: dict[str, _VariantCase] = {
         f"vlguard-{subset.value.replace('_', '-')}": _VariantCase(
             factory=partial(_VLGuardDataset, subset=subset),
             provider_cls=_VLGuardDataset,
+            dataset_name="vlguard",
             seed_metadata={"subset": subset.value, "safe_image": True},
             expected_data_types=frozenset({"text", "image_path"}),
-            # VLGuard's own subcategory list ends in "other", so OTHER here is the
-            # upstream value rather than a failed lookup.
-            forbid_other_harm_category=False,
+            vlguard_instruction_key=instruction_key,
         )
-        for subset in (VLGuardSubset.SAFE_UNSAFES, VLGuardSubset.SAFE_SAFES)
+        for subset, instruction_key in (
+            (VLGuardSubset.SAFE_UNSAFES, "unsafe_instruction"),
+            (VLGuardSubset.SAFE_SAFES, "safe_instruction"),
+        )
     },
 }
+
+
+def _assert_variant_dataset(*, case_id: str, case: _VariantCase, dataset: SeedDataset) -> None:
+    """Check seed identity, shape, categories, and language independently of loader defaults."""
+    assert isinstance(dataset, SeedDataset), f"{case_id} did not return a SeedDataset"
+    assert dataset.dataset_name == case.dataset_name, f"{case_id}: unexpected dataset name"
+    assert dataset.seeds, f"{case_id} returned an empty dataset"
+
+    for seed in dataset.seeds:
+        assert isinstance(seed, case.seed_type), f"{case_id}: unexpected seed type {type(seed).__name__}"
+        assert seed.value, f"Seed in {case_id} has no value"
+        assert seed.dataset_name == case.dataset_name, f"{case_id}: seed dataset_name mismatch"
+        metadata = seed.metadata or {}
+        # VLGuard's safe-image records have no harm labels. Verify that absence against
+        # the raw record below, rather than requiring the loader to invent categories.
+        if case.vlguard_instruction_key is not None and metadata.get("harmful_subcategory") == "":
+            assert not seed.harm_categories, f"{case_id}: unlabeled seed gained harm categories"
+        else:
+            assert seed.harm_categories, f"Seed in {case_id} lost its harm categories"
+        if "OTHER" in (seed.harm_categories or []):
+            subcategory = metadata.get("harmful_subcategory")
+            assert (
+                case.vlguard_instruction_key is not None
+                and isinstance(subcategory, str)
+                and subcategory.strip().lower() == "other"
+            ), f"{case_id}: harm category unexpectedly fell back to OTHER"
+        for key, expected in case.seed_metadata.items():
+            assert metadata.get(key) == expected, f"{case_id}: unexpected seed metadata for {key!r}"
+
+    data_types = {seed.data_type for seed in dataset.seeds}
+    assert data_types == case.expected_data_types, f"{case_id}: unexpected data types {data_types}"
+
+    if case.text_pattern is not None:
+        matches = sum(bool(re.search(case.text_pattern, seed.value)) for seed in dataset.seeds)
+        fraction = matches / len(dataset.seeds)
+        assert fraction >= 0.9, (
+            f"{case_id}: only {fraction:.3f} of seeds match the requested language; expected at least 0.900"
+        )
+
+
+def _expected_vlguard_pairs(
+    *,
+    records: Sequence[Mapping[str, object]],
+    image_dir: pathlib.Path,
+    instruction_key: str,
+) -> Counter[tuple[pathlib.Path, str, str]]:
+    """Validate every selected raw record, including records the loader would discard."""
+    pairs: Counter[tuple[pathlib.Path, str, str]] = Counter()
+    for index, record in enumerate(records):
+        assert isinstance(record.get("safe"), bool), f"VLGuard row {index}: missing or invalid safe flag"
+        if not record["safe"]:
+            continue
+
+        filename = record.get("image")
+        assert isinstance(filename, str) and filename, f"VLGuard row {index}: missing image filename"
+        image_path = image_dir / filename
+        assert image_path.is_file(), f"VLGuard row {index}: image reference does not resolve: {image_path}"
+
+        instr_resp = record.get("instr-resp")
+        assert isinstance(instr_resp, list) and instr_resp, f"VLGuard row {index}: invalid instr-resp"
+        instructions: list[object] = []
+        for item in instr_resp:
+            assert isinstance(item, dict), f"VLGuard row {index}: invalid instr-resp entry"
+            if instruction_key in item:
+                instructions.append(item[instruction_key])
+        assert len(instructions) == 1, f"VLGuard row {index}: missing or ambiguous {instruction_key}"
+        instruction = instructions[0]
+        assert isinstance(instruction, str) and instruction.strip(), (
+            f"VLGuard row {index}: empty or invalid {instruction_key}"
+        )
+        subcategory = record.get("harmful_subcategory", "")
+        assert isinstance(subcategory, str), f"VLGuard row {index}: invalid harmful_subcategory"
+        pairs[(image_path, instruction, subcategory)] += 1
+
+    assert pairs, "VLGuard returned no safe-image records"
+    return pairs
+
+
+def _assert_vlguard_contract(
+    *,
+    dataset: SeedDataset,
+    records: Sequence[Mapping[str, object]],
+    image_dir: pathlib.Path,
+    instruction_key: str,
+) -> None:
+    """Require one simultaneous text/image pair for each selected upstream record."""
+    expected_pairs = _expected_vlguard_pairs(records=records, image_dir=image_dir, instruction_key=instruction_key)
+    groups: dict[UUID, list[SeedPrompt]] = defaultdict(list)
+    for seed in dataset.seeds:
+        assert isinstance(seed, SeedPrompt), "VLGuard must return SeedPrompt instances"
+        assert seed.prompt_group_id is not None, "VLGuard seed has no prompt_group_id"
+        assert seed.sequence == 0, "VLGuard text and image must share sequence 0"
+        groups[seed.prompt_group_id].append(seed)
+
+    actual_pairs: Counter[tuple[pathlib.Path, str, str]] = Counter()
+    for seeds in groups.values():
+        text_seeds = [seed for seed in seeds if seed.data_type == "text"]
+        image_seeds = [seed for seed in seeds if seed.data_type == "image_path"]
+        assert len(seeds) == 2 and len(text_seeds) == len(image_seeds) == 1, (
+            "VLGuard group must contain exactly one text/image pair"
+        )
+        text_seed, image_seed = text_seeds[0], image_seeds[0]
+        subcategory = (text_seed.metadata or {}).get("harmful_subcategory")
+        assert isinstance(subcategory, str), "VLGuard text seed lost its source subcategory"
+        assert (image_seed.metadata or {}).get("harmful_subcategory") == subcategory, (
+            "VLGuard text and image subcategories differ"
+        )
+        actual_pairs[(pathlib.Path(image_seed.value), text_seed.value, subcategory)] += 1
+
+    assert actual_pairs == expected_pairs, (
+        "VLGuard returned pairs do not match the raw records: "
+        f"{sum((expected_pairs - actual_pairs).values())} missing, "
+        f"{sum((actual_pairs - expected_pairs).values())} unexpected"
+    )
 
 
 @retry(
@@ -168,7 +287,7 @@ _VARIANT_CASES: dict[str, _VariantCase] = {
     retry=retry_if_exception_type(_RETRYABLE_ERRORS),
     reraise=True,
 )
-async def _fetch_with_retry(provider) -> SeedDataset:
+async def _fetch_with_retry_async(provider: SeedDatasetProvider) -> SeedDataset:
     """Fetch a dataset with retry on transient network errors."""
     return await provider.fetch_dataset_async(cache=False)
 
@@ -214,7 +333,7 @@ class TestAllDatasets:
             # Limit examples for slow providers that would otherwise exceed _TEST_TIMEOUT
             provider = provider_cls(max_examples=6) if provider_cls in _LIMITED_EXAMPLES_PROVIDERS else provider_cls()
 
-            dataset = await _fetch_with_retry(provider)
+            dataset = await _fetch_with_retry_async(provider)
         except Exception as e:
             # Multimodal providers silently skip failed image downloads. When ALL
             # images fail the resulting empty seed list triggers "SeedDataset cannot
@@ -242,7 +361,7 @@ class TestAllDatasets:
 
     @pytest.mark.timeout(_TEST_TIMEOUT)
     @pytest.mark.parametrize("case_id", sorted(_VARIANT_CASES), ids=sorted(_VARIANT_CASES))
-    async def test_fetch_non_default_variant(self, case_id):
+    async def test_fetch_non_default_variant_async(self, *, case_id: str) -> None:
         """
         Verify a non-default provider configuration against its real upstream artifact.
 
@@ -273,64 +392,23 @@ class TestAllDatasets:
             )
 
         try:
-            dataset = await _fetch_with_retry(provider)
+            dataset = await _fetch_with_retry_async(provider)
         except Exception as e:
             if case.provider_cls in _HF_GATED_PROVIDERS and "gated dataset" in str(e):
                 pytest.skip(f"{case_id}: HF account has not accepted dataset terms ({e})")
             pytest.fail(f"Failed to fetch non-default variant {case_id}: {e}")
 
-        assert isinstance(dataset, SeedDataset), f"{case_id} did not return a SeedDataset"
-        assert dataset.dataset_name, f"{case_id} has no dataset_name"
-        assert len(dataset.seeds) > 0, f"{case_id} returned an empty dataset"
-
-        data_types = set()
-        for seed in dataset.seeds:
-            assert seed.value, f"Seed in {case_id} has no value"
-            assert seed.dataset_name == dataset.dataset_name, (
-                f"Seed dataset_name mismatch in {case_id}: {seed.dataset_name} != {dataset.dataset_name}"
-            )
-            # A category the loader no longer recognises is not dropped, it is mapped
-            # to OTHER with a log line nobody reads, so the seed still looks normal.
-            # Measured on 2026-09-16, none of these variants produce OTHER at all
-            # (6982 seeds across the nine ungated cases), which is what makes its
-            # appearance a usable drift signal rather than noise.
-            assert seed.harm_categories, f"Seed in {case_id} lost its harm categories"
-            if case.forbid_other_harm_category:
-                assert "OTHER" not in seed.harm_categories, (
-                    f"{case_id}: harm category fell back to OTHER for {seed.value[:60]!r}, "
-                    "which means an upstream category no longer maps"
-                )
-            for key, expected in case.seed_metadata.items():
-                actual = (seed.metadata or {}).get(key)
-                assert actual == expected, f"{case_id}: seed metadata {key!r} is {actual!r}, expected {expected!r}"
-            data_types.add(seed.data_type)
-
-        if case.min_non_ascii_fraction is not None:
-            non_ascii = sum(1 for seed in dataset.seeds if any(ord(ch) > 127 for ch in seed.value))
-            fraction = non_ascii / len(dataset.seeds)
-            assert fraction >= case.min_non_ascii_fraction, (
-                f"{case_id}: only {fraction:.3f} of seeds contain non-ASCII text, expected at least "
-                f"{case.min_non_ascii_fraction}. The requested variant was most likely not the one served."
-            )
-
-        assert data_types == set(case.expected_data_types), (
-            f"{case_id}: produced data types {sorted(data_types)}, expected {sorted(case.expected_data_types)}"
-        )
-
-        # An image whose file never landed is dropped silently by the loader, so the
-        # ones that survived are the only evidence the image half of the contract holds.
-        image_seeds = [seed for seed in dataset.seeds if seed.data_type == "image_path"]
-        for seed in image_seeds:
-            assert pathlib.Path(seed.value).exists(), f"{case_id}: image reference does not resolve: {seed.value}"
-
-        if "image_path" in case.expected_data_types:
-            text_seeds = [seed for seed in dataset.seeds if seed.data_type == "text"]
-            assert image_seeds, f"{case_id}: expected image seeds, got none"
-            assert text_seeds, f"{case_id}: expected text seeds, got none"
-            # The instruction and its image are one prompt; a subset that reads the wrong
-            # `instr-resp` field loses the pairing rather than failing outright.
-            assert {seed.prompt_group_id for seed in text_seeds} == {seed.prompt_group_id for seed in image_seeds}, (
-                f"{case_id}: text and image seeds are not paired by prompt_group_id"
+        _assert_variant_dataset(case_id=case_id, case=case, dataset=dataset)
+        if case.vlguard_instruction_key is not None:
+            assert isinstance(provider, _VLGuardDataset)
+            # Inspect the raw artifact just downloaded, without fetching another revision.
+            records, image_dir = await provider._download_dataset_files_async(cache=True)
+            await asyncio.to_thread(
+                _assert_vlguard_contract,
+                dataset=dataset,
+                records=records,
+                image_dir=image_dir,
+                instruction_key=case.vlguard_instruction_key,
             )
 
         logger.info(f"Successfully verified variant {case_id} with {len(dataset.seeds)} seeds")

@@ -246,6 +246,15 @@ describe("api service", () => {
   });
 
   describe("targetsApi", () => {
+    it("should list target types from registry metadata", async () => {
+      const response = { data: { items: [] } };
+      (apiClient.get as jest.Mock).mockResolvedValueOnce(response);
+
+      await expect(targetsApi.listTargetTypes()).resolves.toEqual(response.data);
+
+      expect(apiClient.get).toHaveBeenCalledWith("/targets/types");
+    });
+
     it("should list targets with default params", async () => {
       const mockResponse = {
         data: {
@@ -334,15 +343,6 @@ describe("api service", () => {
       await expect(convertersApi.listConverterTypes()).resolves.toEqual(response.data);
 
       expect(apiClient.get).toHaveBeenCalledWith("/converters/types");
-    });
-
-    it("should keep the converter catalog compatibility endpoint", async () => {
-      const response = { data: { items: [] } };
-      (apiClient.get as jest.Mock).mockResolvedValueOnce(response);
-
-      await expect(convertersApi.listConverterCatalog()).resolves.toEqual(response.data);
-
-      expect(apiClient.get).toHaveBeenCalledWith("/converters/catalog");
     });
 
     it("should list configured converter instances", async () => {
@@ -907,6 +907,17 @@ describe("api service", () => {
         { signal: controller.signal },
       );
       expect(result.status).toBe("CANCELLED");
+    });
+
+    it("resumes the same scenario run without sending configuration or a request body", async () => {
+      const summary = { scenario_result_id: "sr/1", status: "QUEUED", completed_attacks: 2 };
+      (apiClient.post as jest.Mock).mockResolvedValueOnce({ status: 202, data: summary });
+
+      await expect(scenariosApi.resumeRun("sr/1")).resolves.toEqual(summary);
+
+      expect(apiClient.post).toHaveBeenCalledTimes(1);
+      expect(apiClient.post).toHaveBeenCalledWith("/scenarios/runs/sr%2F1/resume");
+      expect(apiClient.get).not.toHaveBeenCalled();
     });
   });
 });

@@ -33,6 +33,7 @@ from pyrit.datasets.seed_datasets.remote import (
     _GarakNpmDataset,
     _GarakPypiDataset,
     _HarmBenchMultimodalDataset,
+    _HarmEvalDataset,
     _HiXSTestDataset,
     _JailbreakV28KDataset,
     _PromptIntelDataset,
@@ -73,6 +74,7 @@ _LIMITED_EXAMPLES_PROVIDERS: set[type] = {
 # and that the token's account has accepted each dataset's terms; skipped when no token
 # is present (e.g. when running E2E locally without secrets).
 _HF_GATED_PROVIDERS: set[type] = {
+    _HarmEvalDataset,
     _HiXSTestDataset,
     _SGXSTestDataset,
     _SorryBenchDataset,

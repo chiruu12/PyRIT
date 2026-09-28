@@ -4,8 +4,13 @@ import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { MemoryRouter, Route, Routes } from "react-router";
 import ChatWindow from "./ChatWindow";
 import { makeTarget } from "@/test-utils/targetFixtures";
+import { UserPreferencesProvider } from "@/hooks/useUserPreferences";
+import { readUserPreferences } from "@/utils/userPreferences";
 import {
+  AddMessageResponse,
   BackendMessage,
+  AttackTargetResolutionStatus,
+  ConverterInstance,
   Message,
   MessageAttachment,
   PromptResponseError,
@@ -50,10 +55,11 @@ jest.mock("../../services/api", () => ({
     createManualScore: jest.fn(),
   },
   convertersApi: {
-    listConverterCatalog: jest.fn(),
     listConverters: jest.fn(),
+    listConverterTypes: jest.fn(),
     getConverter: jest.fn(),
     createConverter: jest.fn(),
+    deleteConverter: jest.fn(),
     previewConversion: jest.fn(),
   },
   labelsApi: {
@@ -62,6 +68,7 @@ jest.mock("../../services/api", () => ({
 }));
 
 jest.mock("../../utils/messageMapper", () => ({
+  ...jest.requireActual<typeof import("../../utils/messageMapper")>("../../utils/messageMapper"),
   buildMessagePieces: jest.fn(),
   backendMessageToFrontend: jest.fn(),
   backendMessageToOriginalDraft: jest.fn(),
@@ -82,7 +89,9 @@ const TestWrapper: React.FC<{ children: React.ReactNode }> = ({
   children,
 }) => (
   <FluentProvider theme={webLightTheme}>
-    <MemoryRouter>{children}</MemoryRouter>
+    <UserPreferencesProvider accountKey="local">
+      <MemoryRouter>{children}</MemoryRouter>
+    </UserPreferencesProvider>
   </FluentProvider>
 );
 
@@ -105,6 +114,26 @@ const mockTarget: TargetInstance = makeTarget({
   endpoint: "https://api.openai.com",
   model_name: "gpt-4",
 });
+
+function makeConverterInstance(
+  converterId: string,
+  className: string,
+  supportedInputTypes = ["text"],
+  supportedOutputTypes = ["text"],
+): ConverterInstance {
+  return {
+    converter_id: converterId,
+    identifier: {
+      class_name: className,
+      class_module: `pyrit.converter.${className}`,
+      hash: `${converterId}-hash`,
+      pyrit_version: "0.0.0",
+      supported_input_types: supportedInputTypes,
+      supported_output_types: supportedOutputTypes,
+    },
+    is_llm_based: false,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Helpers to build mock backend responses
@@ -345,13 +374,18 @@ describe("ChatWindow Integration", () => {
   const defaultProps = {
     onNewAttack: jest.fn(),
     activeTarget: mockTarget,
+    availableTargets: [mockTarget],
+    targetsLoading: false,
+    targetsError: null,
+    onRefreshTargets: jest.fn(),
+    onSelectTarget: jest.fn(),
+    defaultBranchTarget: null,
     attackResultId: null as string | null,
     conversationId: null as string | null,
     activeConversationId: null as string | null,
     onConversationCreated: jest.fn(),
     onSelectConversation: jest.fn(),
     labels: { operator: 'testuser', operation: 'test_op' },
-    onLabelsChange: jest.fn(),
   };
 
   beforeEach(() => {
@@ -363,6 +397,8 @@ describe("ChatWindow Integration", () => {
     mockedMapper.backendMessageToOriginalDraft.mockImplementation(
       actualMessageMapper.backendMessageToOriginalDraft
     );
+    mockedMapper.fileToBase64.mockReset();
+    mockedMapper.fileToBase64.mockImplementation(actualMessageMapper.fileToBase64);
     window.localStorage.clear();
     mockMatchMedia(false);
     // Default: panel API returns empty conversations
@@ -376,9 +412,7 @@ describe("ChatWindow Integration", () => {
     mockedConvertersApi.listConverters.mockResolvedValue({
       items: [],
     });
-    mockedConvertersApi.listConverterCatalog.mockResolvedValue({
-      items: [],
-    });
+    mockedConvertersApi.listConverterTypes.mockResolvedValue({ items: [] });
   });
 
   afterEach(() => {
@@ -405,7 +439,9 @@ describe("ChatWindow Integration", () => {
     expect(screen.getByRole("textbox")).toBeInTheDocument();
   });
 
-  it("should attach an updated human score to the latest response", async () => {
+  it.each<AttackTargetResolutionStatus>(["resolved", "unavailable", "ambiguous", "legacy", "error"])(
+    "should update the human score with target status %s",
+    async (targetResolutionStatus) => {
     const user = userEvent.setup();
     const onHumanScoreChange = jest.fn();
     mockedAttacksApi.getMessages.mockResolvedValue(makeTextResponse("Forked response") as never);
@@ -423,6 +459,8 @@ describe("ChatWindow Integration", () => {
       <TestWrapper>
         <ChatWindow
           {...defaultProps}
+          activeTarget={targetResolutionStatus === "resolved" ? mockTarget : null}
+          targetResolutionStatus={targetResolutionStatus}
           attackResultId="attack-result-id"
           conversationId="primary-conversation-id"
           activeConversationId="forked-conversation-id"
@@ -469,9 +507,12 @@ describe("ChatWindow Integration", () => {
     });
   });
 
-  it("should remove the attack human-score override", async () => {
+  it.each<AttackTargetResolutionStatus>(["resolved", "unavailable", "ambiguous", "legacy", "error"])(
+    "should remove the human score with target status %s",
+    async (targetResolutionStatus) => {
     const user = userEvent.setup();
     const onHumanScoreChange = jest.fn();
+    mockedAttacksApi.getMessages.mockResolvedValue({ messages: [] });
     mockedAttacksApi.removeHumanScore.mockResolvedValue({
       attack_result_id: "attack-result-id",
       conversation_id: "primary-conversation-id",
@@ -490,6 +531,8 @@ describe("ChatWindow Integration", () => {
       <TestWrapper>
         <ChatWindow
           {...defaultProps}
+          activeTarget={targetResolutionStatus === "resolved" ? mockTarget : null}
+          targetResolutionStatus={targetResolutionStatus}
           attackResultId="attack-result-id"
           conversationId="primary-conversation-id"
           activeConversationId="primary-conversation-id"
@@ -542,7 +585,8 @@ describe("ChatWindow Integration", () => {
     const user = userEvent.setup();
     const scenarioResultId = "123e4567-e89b-12d3-a456-426614174000";
     render(
-      <FluentProvider theme={webLightTheme}>
+      <UserPreferencesProvider accountKey="local">
+        <FluentProvider theme={webLightTheme}>
         <MemoryRouter initialEntries={["/attacks/attack-1"]}>
           <Routes>
             <Route
@@ -555,7 +599,8 @@ describe("ChatWindow Integration", () => {
             />
           </Routes>
         </MemoryRouter>
-      </FluentProvider>
+        </FluentProvider>
+      </UserPreferencesProvider>
     );
 
     await user.click(screen.getByRole("link", {
@@ -592,7 +637,7 @@ describe("ChatWindow Integration", () => {
 
     await user.click(toggle);
     expect(toggle).toBeChecked();
-    expect(window.localStorage.getItem(MARKDOWN_PREFERENCE_STORAGE_KEY)).toBe("markdown");
+    expect(readUserPreferences('local').chatMarkdown).toBe(true);
 
     firstRender.unmount();
     const secondRender = render(
@@ -605,7 +650,7 @@ describe("ChatWindow Integration", () => {
 
     await user.click(remountedToggle);
     expect(remountedToggle).not.toBeChecked();
-    expect(window.localStorage.getItem(MARKDOWN_PREFERENCE_STORAGE_KEY)).toBe("raw");
+    expect(readUserPreferences('local').chatMarkdown).toBe(false);
 
     secondRender.unmount();
     render(
@@ -709,16 +754,16 @@ describe("ChatWindow Integration", () => {
     expect(badge).toHaveAttribute("aria-label", expect.stringContaining(mockTarget.target_registry_name));
   });
 
-  it("should show no-target message when target is null", () => {
+  it("should offer target selection in the ribbon without a bottom warning", () => {
     render(
       <TestWrapper>
         <ChatWindow {...defaultProps} activeTarget={null} />
       </TestWrapper>
     );
 
-    // Banner in ChatInputArea area
-    expect(screen.getByTestId("no-target-banner")).toBeInTheDocument();
-    expect(screen.getByTestId("configure-target-input-btn")).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Chat target" })).toHaveValue("");
+    expect(screen.queryByTestId("no-target-banner")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Configure Target" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /add objective/i })).not.toBeInTheDocument();
   });
 
@@ -746,16 +791,15 @@ describe("ChatWindow Integration", () => {
     expect(onNewAttack).toHaveBeenCalled();
   });
 
-  it("should show no-target banner when no target is selected", () => {
+  it("should disable the composer when no target is selected", () => {
     render(
       <TestWrapper>
         <ChatWindow {...defaultProps} activeTarget={null} />
       </TestWrapper>
     );
 
-    // ChatInputArea shows a red warning banner instead of the text input
-    expect(screen.getByTestId("no-target-banner")).toBeInTheDocument();
-    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
   });
 
   it("should disable sending while routed attack metadata is loading", () => {
@@ -823,7 +867,7 @@ describe("ChatWindow Integration", () => {
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
     expect(screen.getByTestId("copy-to-input-btn-0")).toBeDisabled();
     expect(screen.getByTestId("branch-conv-btn-0")).toBeDisabled();
-    expect(screen.getByTestId("branch-attack-btn-0")).toBeDisabled();
+    expect(screen.getByTestId("branch-attack-btn-0")).toBeEnabled();
     expect(await screen.findByTestId("star-btn-conv-related")).toBeDisabled();
     expect(mockedAttacksApi.changeMainConversation).not.toHaveBeenCalled();
 
@@ -843,7 +887,7 @@ describe("ChatWindow Integration", () => {
 
     render(
       <TestWrapper>
-        <ChatWindow {...defaultProps} activeTarget={targetNoModel} />
+        <ChatWindow {...defaultProps} activeTarget={targetNoModel} availableTargets={[targetNoModel]} />
       </TestWrapper>
     );
 
@@ -1274,6 +1318,30 @@ describe("ChatWindow Integration", () => {
           expect.objectContaining({ system_prompt: "You are helpful" })
         );
       });
+
+    });
+
+    it("preserves the draft prompt while its target is unavailable during refresh", async () => {
+      const user = userEvent.setup();
+      primeSendMocks();
+      const supported: TargetInstance = {
+        ...mockTarget,
+        capabilities: buildCapabilities({ supports_system_prompt: true }),
+      };
+      const { rerender } = render(
+        <TestWrapper><ChatWindow {...defaultProps} activeTarget={supported} /></TestWrapper>,
+      );
+      await user.click(screen.getByRole("button", { name: /system prompt/i }));
+      await user.type(screen.getByRole("textbox", { name: /system prompt/i }), "Keep this instruction");
+      await user.type(screen.getByPlaceholderText("Type prompt here"), "Hello");
+      rerender(<TestWrapper><ChatWindow {...defaultProps} activeTarget={null} /></TestWrapper>);
+      expect(screen.getByRole("button", { name: /send/i })).toBeDisabled();
+      expect(mockedAttacksApi.createAttack).not.toHaveBeenCalled();
+      rerender(<TestWrapper><ChatWindow {...defaultProps} activeTarget={supported} /></TestWrapper>);
+      await user.click(screen.getByRole("button", { name: /send/i }));
+      await waitFor(() => expect(mockedAttacksApi.createAttack).toHaveBeenCalledWith(
+        expect.objectContaining({ system_prompt: "Keep this instruction" }),
+      ));
     });
   });
 
@@ -1413,6 +1481,75 @@ describe("ChatWindow Integration", () => {
     await waitFor(() => {
       expect(screen.getByText(/Failed to add message/)).toBeInTheDocument();
     });
+  });
+
+  it("should preserve a first-send error when the created attack route commits later", async () => {
+    const user = userEvent.setup();
+    mockedMapper.buildMessagePieces.mockResolvedValue([
+      { data_type: "text", original_value: "Keep failed draft" },
+    ]);
+    mockedAttacksApi.createAttack.mockResolvedValue({
+      attack_result_id: "ar-created",
+      conversation_id: "conv-created",
+      created_at: "2026-01-01T00:00:00Z",
+    });
+    mockedAttacksApi.addMessage.mockRejectedValue(new Error("First send failed"));
+    mockedAttacksApi.getMessages.mockResolvedValue({ messages: [] });
+    mockedMapper.backendMessagesToFrontend.mockReturnValue([]);
+
+    const { rerender } = render(
+      <TestWrapper>
+        <ChatWindow {...defaultProps} />
+      </TestWrapper>
+    );
+    await user.type(screen.getByRole("textbox"), "Keep failed draft");
+    await user.click(screen.getByRole("button", { name: /send/i }));
+    expect(await screen.findByText(/First send failed/)).toBeInTheDocument();
+
+    rerender(
+      <TestWrapper>
+        <ChatWindow
+          {...defaultProps}
+          attackResultId="ar-created"
+          conversationId="conv-created"
+          activeConversationId="conv-created"
+        />
+      </TestWrapper>
+    );
+
+    expect(mockedAttacksApi.getMessages).not.toHaveBeenCalled();
+    expect(screen.getByText(/First send failed/)).toBeInTheDocument();
+    expect(screen.getByRole("textbox")).toHaveValue("Keep failed draft");
+    expect(screen.getByRole("button", { name: /send/i })).toBeEnabled();
+  });
+
+  it("should reload when returning while another conversation load is still pending", async () => {
+    const history = makeTextResponse("Original history").messages;
+    let finishOtherLoad: (value: typeof history) => void = () => {};
+    mockedAttacksApi.getMessages
+      .mockResolvedValueOnce(history)
+      .mockImplementationOnce(() => new Promise((resolve) => { finishOtherLoad = resolve; }))
+      .mockResolvedValueOnce(history);
+    mockedMapper.backendMessagesToFrontend.mockImplementation(actualMessageMapper.backendMessagesToFrontend);
+    const props = {
+      ...defaultProps,
+      attackResultId: "ar-return",
+      conversationId: "conv-original",
+      activeConversationId: "conv-original",
+    };
+    const { rerender } = render(<TestWrapper><ChatWindow {...props} /></TestWrapper>);
+    expect(await screen.findByText("Original history")).toBeInTheDocument();
+
+    rerender(<TestWrapper><ChatWindow {...props} activeConversationId="conv-other" /></TestWrapper>);
+    expect(mockedAttacksApi.getMessages).toHaveBeenLastCalledWith("ar-return", "conv-other");
+    rerender(<TestWrapper><ChatWindow {...props} /></TestWrapper>);
+    expect(mockedAttacksApi.getMessages).toHaveBeenLastCalledWith("ar-return", "conv-original");
+    expect(await screen.findByText("Original history")).toBeInTheDocument();
+    expect(screen.getByRole("textbox")).toBeEnabled();
+
+    await act(async () => { finishOtherLoad(makeTextResponse("Other history").messages); });
+    expect(screen.getByText("Original history")).toBeInTheDocument();
+    expect(screen.queryByText("Other history")).not.toBeInTheDocument();
   });
 
   it("should extract plain string from axios-style error response", async () => {
@@ -2151,21 +2288,29 @@ describe("ChatWindow Integration", () => {
       conversation_id: "conv-media-recovery",
       created_at: "2026-01-01T00:00:02Z",
     });
-    mockedConvertersApi.listConverterCatalog.mockResolvedValue({
-      items: [{
-        converter_type: "ImageRotationConverter",
-        supported_input_types: ["image_path"],
-        supported_output_types: ["image_path"],
-        parameters: [],
-      }],
-    });
-    mockedConvertersApi.createConverter.mockResolvedValue({
-      converter_id: "preserved-image-converter",
-      converter_type: "ImageRotationConverter",
+    mockedConvertersApi.listConverters.mockResolvedValue({
+      items: [
+        makeConverterInstance(
+          "preserved-image-converter",
+          "ImageRotationConverter",
+          ["image_path"],
+          ["image_path"]
+        ),
+      ],
     });
     mockedConvertersApi.previewConversion.mockResolvedValue({
+      original_value: "/original/evidence.png",
+      original_value_data_type: "image_path",
       converted_value: "/converted/evidence.png",
       converted_value_data_type: "image_path",
+      steps: [{
+        converter_id: "preserved-image-converter",
+        converter_type: "ImageRotationConverter",
+        input_value: "/original/evidence.png",
+        input_data_type: "image_path",
+        output_value: "/converted/evidence.png",
+        output_data_type: "image_path",
+      }],
     });
 
     const rendered = render(<TestWrapper><ChatWindow {...props} /></TestWrapper>);
@@ -2175,14 +2320,16 @@ describe("ChatWindow Integration", () => {
     await user.click(await screen.findByRole("tab", { name: "Image" }));
     await user.click(await screen.findByRole("combobox"));
     await user.click(await screen.findByRole("option", { name: /ImageRotationConverter/ }));
-    await user.click(screen.getByRole("button", { name: /^preview$/i }));
-    await user.click(await screen.findByRole("button", { name: /use converted/i }));
+    await user.click(screen.getByRole("button", { name: /^convert$/i }));
+    await user.click(await screen.findByRole("button", { name: /add converted value/i }));
     await user.click(screen.getByTestId("close-converter-panel-btn"));
     await user.click(screen.getByRole("button", { name: /send message/i }));
     expect(await screen.findByRole("button", { name: /edit in clean conversation/i })).toBeEnabled();
     expect(mockedAttacksApi.addMessage).toHaveBeenLastCalledWith(
       props.attackResultId,
-      expect.objectContaining({ converter_ids: ["preserved-image-converter"] }),
+      expect.objectContaining({
+        pieces: [expect.objectContaining({ applied_converter_ids: ["preserved-image-converter"] })],
+      }),
     );
 
     rendered.rerender(<TestWrapper><ChatWindow {...props} activeConversationId="conv-other" /></TestWrapper>);
@@ -2202,24 +2349,22 @@ describe("ChatWindow Integration", () => {
       <TestWrapper><ChatWindow {...props} activeConversationId="conv-media-recovery" /></TestWrapper>
     );
     await waitFor(() => expect(screen.getByRole("button", { name: /send message/i })).toBeEnabled());
-    expect(deferredReads).toHaveLength(1);
+    expect(deferredReads).toHaveLength(0);
 
     await user.click(screen.getByRole("button", { name: /send message/i }));
-    await waitFor(() => expect(deferredReads).toHaveLength(2));
+    await waitFor(() => expect(deferredReads).toHaveLength(1));
     await act(async () => {
-      await deferredReads[1]();
+      await deferredReads[0]();
     });
     expect(mockedAttacksApi.addMessage).toHaveBeenLastCalledWith(
       props.attackResultId,
       expect.objectContaining({
         target_conversation_id: "conv-media-recovery",
-        converter_ids: ["preserved-image-converter"],
-        pieces: [expect.objectContaining({ data_type: "image_path" })],
+        pieces: [expect.objectContaining({
+          data_type: "image_path", applied_converter_ids: ["preserved-image-converter"],
+        })],
       }),
     );
-    await act(async () => {
-      await deferredReads[0]();
-    });
   });
 
   it("should preserve the draft and expose recovery for an HTTP 200 processing error", async () => {
@@ -2776,21 +2921,29 @@ describe("ChatWindow Integration", () => {
     });
     mockedMapper.backendMessagesToFrontend.mockImplementation(actualMessageMapper.backendMessagesToFrontend);
     mockedMapper.buildMessagePieces.mockImplementation(actualMessageMapper.buildMessagePieces);
-    mockedConvertersApi.listConverterCatalog.mockResolvedValue({
-      items: [{
-        converter_type: "PDFConverter",
-        supported_input_types: ["text"],
-        supported_output_types: ["binary_path"],
-        parameters: [],
-      }],
-    });
-    mockedConvertersApi.createConverter.mockResolvedValue({
-      converter_id: "live-pdf-converter",
-      converter_type: "PDFConverter",
+    mockedConvertersApi.listConverters.mockResolvedValue({
+      items: [
+        makeConverterInstance(
+          "live-pdf-converter",
+          "PDFConverter",
+          ["text"],
+          ["binary_path"]
+        ),
+      ],
     });
     mockedConvertersApi.previewConversion.mockResolvedValue({
+      original_value: "live draft",
+      original_value_data_type: "text",
       converted_value: "/converted/live.pdf",
       converted_value_data_type: "binary_path",
+      steps: [{
+        converter_id: "live-pdf-converter",
+        converter_type: "PDFConverter",
+        input_value: "live draft",
+        input_data_type: "text",
+        output_value: "/converted/live.pdf",
+        output_data_type: "binary_path",
+      }],
     });
 
     const rendered = render(<TestWrapper><ChatWindow {...props} /></TestWrapper>);
@@ -2799,8 +2952,8 @@ describe("ChatWindow Integration", () => {
     await user.click(screen.getByRole("button", { name: /convert/i }));
     await user.click(await screen.findByRole("combobox"));
     await user.click(await screen.findByRole("option", { name: /PDFConverter/ }));
-    await user.click(screen.getByRole("button", { name: /^preview$/i }));
-    await user.click(await screen.findByRole("button", { name: /use converted/i }));
+    await user.click(screen.getByRole("button", { name: /^convert$/i }));
+    await user.click(await screen.findByRole("button", { name: /add converted value/i }));
     await user.click(screen.getByRole("button", { name: /send message/i }));
     expect(await screen.findByRole("button", { name: /edit in clean conversation/i })).toBeEnabled();
 
@@ -2832,7 +2985,7 @@ describe("ChatWindow Integration", () => {
     );
 
     expect(await screen.findByText(/live\.png/)).toBeInTheDocument();
-    expect(screen.getByRole("textbox")).toHaveValue("live draft");
+    expect(screen.getByTestId("chat-input")).toHaveValue("live draft");
     expect(await screen.findByTestId("converted-file-chip")).toHaveTextContent("live.pdf");
     await user.click(screen.getByRole("button", { name: /send message/i }));
     await waitFor(() => {
@@ -2840,7 +2993,7 @@ describe("ChatWindow Integration", () => {
         props.attackResultId,
         expect.objectContaining({
           target_conversation_id: "conv-matching-recovery",
-          converter_ids: ["live-pdf-converter"],
+          pieces: expect.arrayContaining([expect.objectContaining({ applied_converter_ids: ["live-pdf-converter"] })]),
         })
       );
     });
@@ -3000,29 +3153,39 @@ describe("ChatWindow Integration", () => {
     expect(screen.getAllByText("evidence.png", { exact: false })).toHaveLength(1);
     expect(screen.queryByText(/converted\.pdf/i)).not.toBeInTheDocument();
 
-    mockedConvertersApi.listConverterCatalog.mockResolvedValue({
-      items: [{
-        converter_type: "RecoveredMediaConverter",
-        supported_input_types: [originalDataType],
-        supported_output_types: [originalDataType],
-        parameters: [],
-      }],
-    });
-    mockedConvertersApi.createConverter.mockResolvedValue({
-      converter_id: "recovered-media-converter",
-      converter_type: "RecoveredMediaConverter",
+    mockedConvertersApi.listConverters.mockResolvedValue({
+      items: [
+        makeConverterInstance(
+          "recovered-media-converter",
+          "RecoveredMediaConverter",
+          [originalDataType],
+          [originalDataType]
+        ),
+      ],
     });
     mockedConvertersApi.previewConversion.mockResolvedValue({
+      original_value: "/original/evidence.png",
+      original_value_data_type: originalDataType,
       converted_value: "/converted/evidence.png",
       converted_value_data_type: originalDataType,
+      steps: [{
+        converter_id: "recovered-media-converter",
+        converter_type: "RecoveredMediaConverter",
+        input_value: "/original/evidence.png",
+        input_data_type: originalDataType,
+        output_value: "/converted/evidence.png",
+        output_data_type: originalDataType,
+      }],
     });
     await user.click(screen.getByRole("button", { name: /convert/i }));
-    await user.click(screen.getByRole("tab", { name: originalDataType === "image_path" ? "Image" : "file" }));
+    await user.click(screen.getByRole("tab", {
+      name: originalDataType === "image_path" ? "Image" : /file/i,
+    }));
     await user.click(await screen.findByRole("combobox"));
     await user.click(await screen.findByRole("option", { name: /RecoveredMediaConverter/ }));
-    const previewButton = screen.getByRole("button", { name: /^preview$/i });
-    expect(previewButton).toBeEnabled();
-    await user.click(previewButton);
+    const convertButton = screen.getByRole("button", { name: /^convert$/i });
+    expect(convertButton).toBeEnabled();
+    await user.click(convertButton);
     await waitFor(() => {
       expect(mockedConvertersApi.previewConversion).toHaveBeenCalledWith({
         original_value: "/original/evidence.png",
@@ -3030,7 +3193,7 @@ describe("ChatWindow Integration", () => {
         converter_ids: ["recovered-media-converter"],
       });
     });
-    await user.click(await screen.findByRole("button", { name: /use converted/i }));
+    await user.click(await screen.findByRole("button", { name: /add converted value/i }));
 
     mockedMapper.buildMessagePieces.mockImplementation(actualMessageMapper.buildMessagePieces);
     mockedAttacksApi.addMessage.mockResolvedValue(makeTextResponse("recovered") as never);
@@ -3040,11 +3203,11 @@ describe("ChatWindow Integration", () => {
         "ar-persisted-processing",
         expect.objectContaining({
           target_conversation_id: "conv-persisted-recovery",
-          converter_ids: ["recovered-media-converter"],
           pieces: expect.arrayContaining([
             expect.objectContaining({
               data_type: originalDataType,
               original_value: "/original/evidence.png",
+              applied_converter_ids: ["recovered-media-converter"],
             }),
           ]),
         })
@@ -3649,16 +3812,18 @@ describe("ChatWindow Integration", () => {
   // No message sent when target is null (guard)
   // -----------------------------------------------------------------------
 
-  it("should show no-target banner when active target is null", () => {
+  it("should block send when active target is null", async () => {
+    const user = userEvent.setup();
     render(
       <TestWrapper>
         <ChatWindow {...defaultProps} activeTarget={null} />
       </TestWrapper>
     );
 
-    // ChatInputArea shows banner instead of textbox
-    expect(screen.getByTestId("no-target-banner")).toBeInTheDocument();
-    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    const send = screen.getByRole("button", { name: "Send message" });
+    expect(send).toBeDisabled();
+    await user.click(send);
+    expect(mockedAttacksApi.addMessage).not.toHaveBeenCalled();
   });
 
   // -----------------------------------------------------------------------
@@ -4354,7 +4519,9 @@ describe("ChatWindow Integration", () => {
   // handleBranchAttack
   // -----------------------------------------------------------------------
 
-  it("should branch into a new attack and load cloned messages", async () => {
+  it("should branch into a new attack with the selected destination target", async () => {
+    const user = userEvent.setup();
+    const destination = makeTarget({ target_registry_name: "branch-target" });
     const onConversationCreated = jest.fn();
     const mockMessages: Message[] = [
       { role: "user", content: "hello" },
@@ -4374,6 +4541,7 @@ describe("ChatWindow Integration", () => {
           attackResultId="ar-branch-attack"
           conversationId="conv-branch-attack"
           activeConversationId="conv-branch-attack"
+          availableTargets={[mockTarget, destination]}
           onConversationCreated={onConversationCreated}
           relatedConversationCount={0}
         />
@@ -4394,23 +4562,67 @@ describe("ChatWindow Integration", () => {
     mockedMapper.backendMessagesToFrontend.mockReturnValue(clonedMessages);
 
     const branchBtn = screen.getByTestId("branch-attack-btn-1");
-    await userEvent.click(branchBtn);
+    await user.click(branchBtn);
+    const destinationSelector = await screen.findByRole("combobox", { name: "Destination target" });
+    await user.selectOptions(destinationSelector, "branch-target");
+    expect(destinationSelector).toHaveValue("branch-target");
+    expect(mockedAttacksApi.createAttack).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Create attack" }));
 
     await waitFor(() => {
       expect(mockedAttacksApi.createAttack).toHaveBeenCalledWith(
         expect.objectContaining({
-          target_registry_name: "openai_chat_1",
+          target_registry_name: "branch-target",
           source_conversation_id: "conv-branch-attack",
           cutoff_index: 1,
         })
       );
-      expect(onConversationCreated).toHaveBeenCalledWith("ar-new-branch", "conv-new-branch");
+      expect(onConversationCreated).toHaveBeenCalledWith("ar-new-branch", "conv-new-branch", undefined, destination);
     });
   });
 
   // -----------------------------------------------------------------------
   // handleChangeMainConversation
   // -----------------------------------------------------------------------
+
+  it.each(["another conversation", "another page"])(
+    "should not navigate on late branch success after opening %s",
+    async (destination: string) => {
+      const user = userEvent.setup();
+      const onConversationCreated = jest.fn();
+      type CreateResponse = Awaited<ReturnType<typeof attacksApi.createAttack>>;
+      let resolveCreate: (value: CreateResponse) => void = () => {};
+      const pendingCreate = new Promise<CreateResponse>((resolve) => { resolveCreate = resolve; });
+      mockedAttacksApi.createAttack.mockReturnValue(pendingCreate);
+      mockedAttacksApi.getMessages.mockResolvedValue({ messages: [] });
+      mockedMapper.backendMessagesToFrontend.mockReturnValue([{ role: "assistant", content: "Source reply" }]);
+      const props = {
+        ...defaultProps,
+        attackResultId: "source-attack",
+        conversationId: "source-conversation",
+        activeConversationId: "source-conversation",
+        onConversationCreated,
+      };
+      const rendered = render(<TestWrapper><ChatWindow {...props} /></TestWrapper>);
+      await user.click(await screen.findByTestId("branch-attack-btn-0"));
+      await user.click(await screen.findByRole("button", { name: "Create attack" }));
+      expect(mockedAttacksApi.createAttack).toHaveBeenCalledTimes(1);
+      if (destination === "another page") {
+        rendered.unmount();
+      } else {
+        rendered.rerender(
+          <TestWrapper><ChatWindow {...props} activeConversationId="another-conversation" /></TestWrapper>
+        );
+      }
+      await act(async () => resolveCreate({
+        attack_result_id: "created-branch",
+        conversation_id: "created-conversation",
+        created_at: "2026-01-01T00:00:00Z",
+      }));
+      expect(onConversationCreated).not.toHaveBeenCalled();
+      expect(mockedAttacksApi.getMessages).not.toHaveBeenCalledWith("created-branch", "created-conversation");
+    },
+  );
 
   it("should call changeMainConversation API via conversation panel", async () => {
     mockedAttacksApi.getConversations.mockResolvedValue({
@@ -4522,6 +4734,7 @@ describe("ChatWindow Integration", () => {
 
     const useTemplateBtn = screen.getByTestId("use-as-template-btn");
     await userEvent.click(useTemplateBtn);
+    await userEvent.click(await screen.findByRole("button", { name: "Create attack" }));
 
     await waitFor(() => {
       expect(mockedAttacksApi.createAttack).toHaveBeenCalledWith(
@@ -4531,7 +4744,7 @@ describe("ChatWindow Integration", () => {
           cutoff_index: 1,
         })
       );
-      expect(onConversationCreated).toHaveBeenCalledWith("ar-template", "conv-template");
+      expect(onConversationCreated).toHaveBeenCalledWith("ar-template", "conv-template", undefined, mockTarget);
     });
   });
 
@@ -4799,15 +5012,8 @@ describe("ChatWindow Integration", () => {
   });
 
   it("should load and display converters in the converter panel", async () => {
-    mockedConvertersApi.listConverterCatalog.mockResolvedValue({
-      items: [
-        {
-          converter_type: "Base64Converter",
-          supported_input_types: ["text"],
-          supported_output_types: ["text"],
-          parameters: [],
-        },
-      ],
+    mockedConvertersApi.listConverters.mockResolvedValue({
+      items: [makeConverterInstance("base64-default", "Base64Converter")],
     });
 
     render(
@@ -4827,8 +5033,8 @@ describe("ChatWindow Integration", () => {
     await waitFor(() => {
       expect(screen.getByTestId("converter-panel-list")).toBeInTheDocument();
       expect(screen.getByTestId("converter-panel-select")).toBeInTheDocument();
-      expect(screen.getByTestId("converter-preview-btn")).toBeInTheDocument();
-      expect(screen.getByText("Converted output will appear here.")).toBeInTheDocument();
+      expect(screen.getByTestId("converter-input-value")).toBeInTheDocument();
+      expect(screen.queryByTestId("converter-preview-btn")).not.toBeInTheDocument();
     });
 
     // Select a converter
@@ -4838,33 +5044,16 @@ describe("ChatWindow Integration", () => {
     await userEvent.click(option);
 
     await waitFor(() => {
-      expect(screen.getByTestId("converter-item-Base64Converter")).toBeInTheDocument();
-      expect(screen.getByText("In:")).toBeInTheDocument();
-      expect(screen.getByText("Out:")).toBeInTheDocument();
-      expect(screen.getByTestId("converter-output")).toBeInTheDocument();
-      // No params section when parameters is empty
+      expect(screen.getByTestId("converter-item-base64-default")).toBeInTheDocument();
+      expect(screen.getByTestId("converter-stage-output-0")).toBeInTheDocument();
+      expect(screen.getByTestId("converter-preview-btn")).toBeInTheDocument();
       expect(screen.queryByTestId("converter-params")).not.toBeInTheDocument();
     });
   });
 
-  it("should show parameter form when converter has parameters", async () => {
-    mockedConvertersApi.listConverterCatalog.mockResolvedValue({
-      items: [
-        {
-          converter_type: "Base64Converter",
-          supported_input_types: ["text"],
-          supported_output_types: ["text"],
-          parameters: [
-            {
-              name: "encoding_func",
-              type_name: "str",
-              required: false,
-              default: "b64encode",
-              choices: ["b64encode", "urlsafe_b64encode"],
-            },
-          ],
-        },
-      ],
+  it("should not show constructor parameters for a registered converter", async () => {
+    mockedConvertersApi.listConverters.mockResolvedValue({
+      items: [makeConverterInstance("base64-configured", "Base64Converter")],
     });
 
     render(
@@ -4881,36 +5070,31 @@ describe("ChatWindow Integration", () => {
 
     await userEvent.click(screen.getByTestId("toggle-converter-panel-btn"));
 
-    // Select the converter that has parameters
     const input = screen.getByRole("combobox");
     await userEvent.click(input);
     const option = await screen.findByRole("option", { name: /Base64Converter/ });
     await userEvent.click(option);
 
-    await waitFor(() => {
-      expect(screen.getByTestId("converter-params")).toBeInTheDocument();
-      expect(screen.getByTestId("param-encoding_func")).toBeInTheDocument();
-      expect(screen.getByText("Parameters")).toBeInTheDocument();
-    });
+    expect(screen.queryByTestId("converter-params")).not.toBeInTheDocument();
   });
 
-  it("should preview conversion when Preview button is clicked", async () => {
-    mockedConvertersApi.listConverterCatalog.mockResolvedValue({
-      items: [
-        {
-          converter_type: "Base64Converter",
-          supported_input_types: ["text"],
-          supported_output_types: ["text"],
-          parameters: [],
-        },
-      ],
-    });
-    mockedConvertersApi.createConverter.mockResolvedValue({
-      converter_id: "test-conv-id",
-      converter_type: "Base64Converter",
+  it("should convert with the registered converter when Convert is clicked", async () => {
+    mockedConvertersApi.listConverters.mockResolvedValue({
+      items: [makeConverterInstance("test-conv-id", "Base64Converter")],
     });
     mockedConvertersApi.previewConversion.mockResolvedValue({
+      original_value: "hello",
+      original_value_data_type: "text",
       converted_value: "aGVsbG8=",
+      converted_value_data_type: "text",
+      steps: [{
+        converter_id: "test-conv-id",
+        converter_type: "Base64Converter",
+        input_value: "hello",
+        input_data_type: "text",
+        output_value: "aGVsbG8=",
+        output_data_type: "text",
+      }],
     });
 
     render(
@@ -4942,18 +5126,14 @@ describe("ChatWindow Integration", () => {
       expect(screen.getByTestId("converter-preview-btn")).toBeInTheDocument();
     });
 
-    // Click Preview — should use chat input text
+    // Click Convert — should use chat input text
     await userEvent.click(screen.getByTestId("converter-preview-btn"));
 
-    await waitFor(() => {
-      expect(screen.getByTestId("converter-preview-result")).toBeInTheDocument();
-      expect(screen.getByText("aGVsbG8=")).toBeInTheDocument();
-    });
+    const previewResult = await screen.findByTestId("converter-preview-result");
+    expect(within(previewResult).getByRole("textbox", { name: "Stage 1 output - Text" }))
+      .toHaveValue("aGVsbG8=");
 
-    expect(mockedConvertersApi.createConverter).toHaveBeenCalledWith({
-      type: "Base64Converter",
-      params: {},
-    });
+    expect(mockedConvertersApi.createConverter).not.toHaveBeenCalled();
     expect(mockedConvertersApi.previewConversion).toHaveBeenCalledWith({
       original_value: "hello",
       converter_ids: ["test-conv-id"],
@@ -4961,21 +5141,11 @@ describe("ChatWindow Integration", () => {
     });
   });
 
-  it("should switch converter details when a different dropdown option is selected", async () => {
-    mockedConvertersApi.listConverterCatalog.mockResolvedValue({
+  it("should keep converter details when another dropdown option is selected", async () => {
+    mockedConvertersApi.listConverters.mockResolvedValue({
       items: [
-        {
-          converter_type: "Base64Converter",
-          supported_input_types: ["text"],
-          supported_output_types: ["text"],
-          parameters: [],
-        },
-        {
-          converter_type: "CharSwapConverter",
-          supported_input_types: ["text"],
-          supported_output_types: ["text"],
-          parameters: [],
-        },
+        makeConverterInstance("base64-default", "Base64Converter"),
+        makeConverterInstance("char-swap-default", "CharSwapConverter"),
       ],
     });
 
@@ -5000,7 +5170,7 @@ describe("ChatWindow Integration", () => {
     await userEvent.click(firstOption);
 
     await waitFor(() => {
-      expect(screen.getByTestId("converter-item-Base64Converter")).toBeInTheDocument();
+      expect(screen.getByTestId("converter-item-base64-default")).toBeInTheDocument();
     });
 
     // Click combobox to open the dropdown listbox
@@ -5011,7 +5181,8 @@ describe("ChatWindow Integration", () => {
     await userEvent.click(option);
 
     await waitFor(() => {
-      expect(screen.getByTestId("converter-item-CharSwapConverter")).toBeInTheDocument();
+      expect(screen.getByTestId("converter-item-base64-default")).toBeInTheDocument();
+      expect(screen.getByTestId("converter-item-char-swap-default")).toBeInTheDocument();
     });
   });
 
@@ -5130,7 +5301,10 @@ describe("ChatWindow Integration", () => {
     await waitFor(() => {
       expect(mockedMapper.buildMessagePieces).toHaveBeenCalledWith(
         "Here is an image",
-        [copiedAttachments[0], copiedAttachments[2]]
+        [
+          { ...copiedAttachments[0], draftId: expect.any(String) },
+          { ...copiedAttachments[2], draftId: expect.any(String) },
+        ]
       );
     });
   });
@@ -5198,7 +5372,7 @@ describe("ChatWindow Integration", () => {
   it("should open converter panel when toggle button is clicked and pass props", async () => {
     mockedAttacksApi.getMessages.mockResolvedValue({ messages: [] });
     mockedMapper.backendMessagesToFrontend.mockReturnValue([]);
-    mockedConvertersApi.listConverterCatalog.mockResolvedValue({ items: [] });
+    mockedConvertersApi.listConverters.mockResolvedValue({ items: [] });
 
     render(
       <TestWrapper>
@@ -5233,7 +5407,7 @@ describe("ChatWindow Integration", () => {
   });
 
   it("should pass input text and attachments to converter panel", async () => {
-    mockedConvertersApi.listConverterCatalog.mockResolvedValue({ items: [] });
+    mockedConvertersApi.listConverters.mockResolvedValue({ items: [] });
 
     render(
       <TestWrapper>
@@ -5260,7 +5434,7 @@ describe("ChatWindow Integration", () => {
   });
 
   it("should handle onClearConversion and onConvertedValueChange from ChatInputArea", async () => {
-    mockedConvertersApi.listConverterCatalog.mockResolvedValue({ items: [] });
+    mockedConvertersApi.listConverters.mockResolvedValue({ items: [] });
 
     render(
       <TestWrapper>
@@ -5275,7 +5449,7 @@ describe("ChatWindow Integration", () => {
     );
 
     // Open converter panel — this exercises onToggleConverterPanel (L584),
-    // ConverterPanel onClose (L508), and onUseConvertedValue (L509)
+    // ConverterPanel onClose (L508), and onUseConvertedValues (L509)
     await userEvent.click(screen.getByTestId("toggle-converter-panel-btn"));
     await waitFor(() => {
       expect(screen.getByTestId("converter-panel")).toBeInTheDocument();
@@ -5298,24 +5472,245 @@ describe("ChatWindow Integration", () => {
   // Text → File converter flow (e.g. PDFConverter)
   // -----------------------------------------------------------------------
 
-  it("should render converted-file chip and synthesize file attachment when a text→file converter is used", async () => {
-    mockedConvertersApi.listConverterCatalog.mockResolvedValue({
-      items: [
-        {
-          converter_type: "PDFConverter",
-          supported_input_types: ["text"],
-          supported_output_types: ["binary_path"],
-          parameters: [],
+  it.each([false, true])("sends only the successful image after a partial failure (remove failed input: %s)", async (removeFailed: boolean) => {
+    const user = userEvent.setup();
+    mockedConvertersApi.listConverters.mockResolvedValue({
+      items: [makeConverterInstance("compress", "ImageCompressionConverter", ["image_path"], ["image_path"])],
+    });
+    mockedConvertersApi.previewConversion.mockImplementation(async (request) => {
+      if (request.original_value.endsWith("Zmlyc3Q=")) throw new Error("First image failed");
+      return {
+        original_value: request.original_value,
+        original_value_data_type: "image_path",
+        converted_value: "/converted/second.png",
+        converted_value_data_type: "image_path",
+        steps: [{
+          converter_id: "compress", converter_type: "ImageCompressionConverter",
+          input_value: request.original_value, input_data_type: "image_path",
+          output_value: "/converted/second.png", output_data_type: "image_path",
+        }],
+      };
+    });
+    mockedMapper.buildMessagePieces.mockImplementation(actualMessageMapper.buildMessagePieces);
+    mockedMapper.backendMessagesToFrontend.mockReturnValue([]);
+    mockedAttacksApi.getMessages.mockResolvedValue({ messages: [] });
+    mockedAttacksApi.addMessage.mockImplementation(() => new Promise(() => {}));
+    render(<TestWrapper><ChatWindow
+      {...defaultProps}
+      attackResultId="ar-pieces"
+      conversationId="conv-pieces"
+      activeConversationId="conv-pieces"
+      activeTarget={makeTarget({
+        capabilities: buildCapabilities({ supported_input_modalities: ["text", "image_path"] }),
+      })}
+    /></TestWrapper>);
+    await waitFor(() => expect(screen.getByTestId("chat-input")).toBeEnabled());
+    await user.upload(screen.getByTestId("file-input"), [
+      new File(["first"], "same.png", { type: "image/png" }),
+      new File(["second"], "same.png", { type: "image/png" }),
+    ]);
+    await user.click(screen.getByRole("button", { name: "Toggle converter panel" }));
+    await user.click(await screen.findByRole("tab", { name: "Image" }));
+    await user.click(screen.getByRole("combobox", { name: "Add converter" }));
+    await user.click(await screen.findByRole("option", { name: /ImageCompressionConverter/ }));
+    await user.click(screen.getByRole("button", { name: "Convert", exact: true }));
+    expect(await screen.findByTestId("converter-preview-error")).toHaveTextContent("First image failed");
+    await user.click(screen.getByRole("button", { name: "Add converted value" }));
+    expect(screen.getAllByTestId("clear-media-conversion-image")).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "Close converters" }));
+    if (removeFailed) await user.click(screen.getByTestId("remove-attachment-0"));
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => expect(mockedAttacksApi.addMessage).toHaveBeenCalledWith("ar-pieces", expect.objectContaining({
+      pieces: expect.arrayContaining([expect.objectContaining({ applied_converter_ids: ["compress"] })]),
+    })));
+    const request = mockedAttacksApi.addMessage.mock.calls[0][1];
+    expect(request.pieces[removeFailed ? 0 : 1].original_value).toBe("c2Vjb25k");
+    expect(request.pieces[removeFailed ? 0 : 1].applied_converter_ids).toEqual(["compress"]);
+    expect(request.pieces).toHaveLength(removeFailed ? 1 : 2);
+  });
+
+  it("keeps a pipeline after sending but does not reuse the previous message's applied result", async () => {
+    const user = userEvent.setup();
+    mockedConvertersApi.listConverters.mockResolvedValue({ items: [makeConverterInstance("base64", "Base64Converter")] });
+    mockedConvertersApi.previewConversion.mockResolvedValue({
+      original_value: "hello", original_value_data_type: "text",
+      converted_value: "aGVsbG8=", converted_value_data_type: "text",
+      steps: [{
+        converter_id: "base64", converter_type: "Base64Converter",
+        input_value: "hello", input_data_type: "text", output_value: "aGVsbG8=", output_data_type: "text",
+      }],
+    });
+    mockedAttacksApi.getMessages.mockResolvedValue({ messages: [] });
+    mockedMapper.buildMessagePieces.mockImplementation(actualMessageMapper.buildMessagePieces);
+    mockedMapper.backendMessagesToFrontend.mockReturnValue([]);
+    mockedAttacksApi.addMessage.mockResolvedValue(makeTextResponse("response") as never);
+    render(<TestWrapper><ChatWindow
+      {...defaultProps} attackResultId="ar-persist" conversationId="conv-persist" activeConversationId="conv-persist"
+    /></TestWrapper>);
+    await waitFor(() => expect(screen.getByTestId("chat-input")).toBeEnabled());
+    await user.type(screen.getByTestId("chat-input"), "hello");
+    await user.click(screen.getByRole("button", { name: "Toggle converter panel" }));
+    await user.click(await screen.findByRole("combobox", { name: "Add converter" }));
+    await user.click(await screen.findByRole("option", { name: /Base64Converter/ }));
+    await user.click(screen.getByRole("button", { name: "Convert", exact: true }));
+    await user.click(screen.getByRole("button", { name: "Add converted value" }));
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(screen.getByTestId("chat-input")).toHaveValue(""));
+    expect(screen.getByTestId("converter-item-base64")).toBeInTheDocument();
+    expect(screen.queryByTestId("converted-indicator")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add converted value" })).toBeDisabled();
+    await user.type(screen.getByTestId("chat-input"), "next");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(mockedAttacksApi.addMessage).toHaveBeenCalledTimes(2));
+    expect(mockedAttacksApi.addMessage.mock.calls[0][1].pieces[0].applied_converter_ids).toEqual(["base64"]);
+    expect(mockedAttacksApi.addMessage.mock.calls[1][1].pieces[0].applied_converter_ids).toBeUndefined();
+  });
+
+  it.each(["Working input - Text", "Stage 1 output - Text"])(
+    "keeps unapplied edits to %s made while a send is pending",
+    async (editorLabel: string) => {
+      const user = userEvent.setup();
+      let finishSend: (response: AddMessageResponse) => void = () => { throw new Error("Send not started"); };
+      mockedConvertersApi.listConverters.mockResolvedValue({ items: [makeConverterInstance("base64", "Base64Converter")] });
+      mockedConvertersApi.previewConversion.mockResolvedValue({
+        original_value: "hello", original_value_data_type: "text",
+        converted_value: "aGVsbG8=", converted_value_data_type: "text",
+        steps: [{
+          converter_id: "base64", converter_type: "Base64Converter",
+          input_value: "hello", input_data_type: "text", output_value: "aGVsbG8=", output_data_type: "text",
+        }],
+      });
+      mockedAttacksApi.getMessages.mockResolvedValue({ messages: [] });
+      mockedMapper.buildMessagePieces.mockImplementation(actualMessageMapper.buildMessagePieces);
+      mockedMapper.backendMessagesToFrontend.mockReturnValue([]);
+      mockedAttacksApi.addMessage.mockImplementation(() => new Promise((resolve) => { finishSend = resolve; }));
+      render(<TestWrapper><ChatWindow
+        {...defaultProps} attackResultId="ar-editing" conversationId="conv-editing" activeConversationId="conv-editing"
+      /></TestWrapper>);
+      await waitFor(() => expect(screen.getByTestId("chat-input")).toBeEnabled());
+      await user.type(screen.getByTestId("chat-input"), "hello");
+      await user.click(screen.getByRole("button", { name: "Toggle converter panel" }));
+      await user.click(await screen.findByRole("combobox", { name: "Add converter" }));
+      await user.click(await screen.findByRole("option", { name: /Base64Converter/ }));
+      await user.click(screen.getByRole("button", { name: "Convert", exact: true }));
+      await screen.findByRole("textbox", { name: "Stage 1 output - Text" });
+      await user.click(screen.getByRole("button", { name: "Send message" }));
+      await waitFor(() => expect(mockedAttacksApi.addMessage).toHaveBeenCalledTimes(1));
+      const editor = screen.getByRole("textbox", { name: editorLabel });
+      await user.clear(editor);
+      await user.type(editor, "next draft");
+
+      await act(async () => { finishSend({
+        attack: {
+          attack_result_id: "ar-editing", conversation_id: "conv-editing",
+          attack_type: "ManualAttack", objective: "", converters: [], message_count: 2,
+          related_conversation_ids: [], labels: {}, created_at: "", updated_at: "",
         },
+        messages: { messages: [] },
+      }); });
+
+      expect(screen.getByTestId("chat-input")).toHaveValue("hello");
+      expect(screen.getByRole("textbox", { name: editorLabel })).toHaveValue("next draft");
+      expect(screen.getByRole("button", { name: "Add converted value" })).toBeEnabled();
+    },
+  );
+
+  it.each(["original chat", ""])("sends the exact edited pane result with original text %j", async (original: string) => {
+    const user = userEvent.setup();
+    mockedConvertersApi.listConverters.mockResolvedValue({ items: [makeConverterInstance("base64", "Base64Converter")] });
+    mockedConvertersApi.previewConversion.mockResolvedValue({
+      original_value: "working draft", original_value_data_type: "text",
+      converted_value: "generated", converted_value_data_type: "text",
+      steps: [{
+        converter_id: "base64", converter_type: "Base64Converter",
+        input_value: "working draft", input_data_type: "text", output_value: "generated", output_data_type: "text",
+      }],
+    });
+    mockedAttacksApi.getMessages.mockResolvedValue({ messages: [] });
+    mockedMapper.buildMessagePieces.mockImplementation(actualMessageMapper.buildMessagePieces);
+    mockedMapper.backendMessagesToFrontend.mockReturnValue([]);
+    mockedAttacksApi.addMessage.mockImplementation(() => new Promise(() => {}));
+    render(<TestWrapper><ChatWindow
+      {...defaultProps} attackResultId="ar-edited" conversationId="conv-edited" activeConversationId="conv-edited"
+    /></TestWrapper>);
+    await waitFor(() => expect(screen.getByTestId("chat-input")).toBeEnabled());
+    if (original) await user.type(screen.getByTestId("chat-input"), original);
+    await user.click(screen.getByRole("button", { name: "Toggle converter panel" }));
+    await user.click(await screen.findByRole("combobox", { name: "Add converter" }));
+    await user.click(await screen.findByRole("option", { name: /Base64Converter/ }));
+    const working = screen.getByRole("textbox", { name: "Working input - Text" });
+    await user.clear(working);
+    await user.type(working, "working draft");
+    expect(screen.getByTestId("chat-input")).toHaveValue(original);
+    await user.click(screen.getByRole("button", { name: "Convert", exact: true }));
+    const output = await screen.findByRole("textbox", { name: "Stage 1 output - Text" });
+    await user.clear(output);
+    await user.type(output, "final manual result");
+    await user.click(screen.getByRole("button", { name: "Add converted value" }));
+    expect(screen.getByTestId("chat-input")).toHaveValue(original);
+    expect(screen.getByRole("textbox", { name: /converted prompt/i })).toHaveValue("final manual result");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(mockedAttacksApi.addMessage).toHaveBeenCalledWith("ar-edited", expect.objectContaining({
+      pieces: [{
+        data_type: "text", original_value: original,
+        converted_value: "final manual result", converted_value_data_type: "text",
+        applied_converter_ids: ["base64"],
+      }],
+    })));
+    expect(mockedConvertersApi.previewConversion).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends a manual conversion when only the pane working input is edited", async () => {
+    const user = userEvent.setup();
+    mockedConvertersApi.listConverters.mockResolvedValue({ items: [] });
+    mockedAttacksApi.getMessages.mockResolvedValue({ messages: [] });
+    mockedMapper.buildMessagePieces.mockImplementation(actualMessageMapper.buildMessagePieces);
+    mockedMapper.backendMessagesToFrontend.mockReturnValue([]);
+    mockedAttacksApi.addMessage.mockImplementation(() => new Promise(() => {}));
+    render(<TestWrapper><ChatWindow
+      {...defaultProps} attackResultId="ar-manual" conversationId="conv-manual" activeConversationId="conv-manual"
+    /></TestWrapper>);
+    await waitFor(() => expect(screen.getByTestId("chat-input")).toBeEnabled());
+    await user.type(screen.getByTestId("chat-input"), "original chat");
+    await user.click(screen.getByRole("button", { name: "Toggle converter panel" }));
+    const working = await screen.findByRole("textbox", { name: "Working input - Text" });
+    await user.clear(working);
+    await user.type(working, "manual result");
+    await user.click(screen.getByRole("button", { name: "Add converted value" }));
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => expect(mockedAttacksApi.addMessage).toHaveBeenCalledWith("ar-manual", expect.objectContaining({
+      pieces: [{
+        data_type: "text",
+        original_value: "original chat",
+        converted_value: "manual result",
+        converted_value_data_type: "text",
+        applied_converter_ids: [],
+      }],
+    })));
+    expect(mockedConvertersApi.previewConversion).not.toHaveBeenCalled();
+  });
+
+  it("should render converted-file chip and synthesize file attachment when a text→file converter is used", async () => {
+    mockedConvertersApi.listConverters.mockResolvedValue({
+      items: [
+        makeConverterInstance("conv-pdf", "PDFConverter", ["text"], ["binary_path"]),
       ],
     });
-    mockedConvertersApi.createConverter.mockResolvedValue({
-      converter_id: "conv-pdf",
-      converter_type: "PDFConverter",
-    });
     mockedConvertersApi.previewConversion.mockResolvedValue({
+      original_value: "make a pdf",
+      original_value_data_type: "text",
       converted_value: "/tmp/results/report.pdf",
       converted_value_data_type: "binary_path",
+      steps: [{
+        converter_id: "conv-pdf",
+        converter_type: "PDFConverter",
+        input_value: "make a pdf",
+        input_data_type: "text",
+        output_value: "/tmp/results/report.pdf",
+        output_data_type: "binary_path",
+      }],
     });
     mockedAttacksApi.createAttack.mockResolvedValue({
       attack_result_id: "ar-pdf",
@@ -5344,12 +5739,12 @@ describe("ChatWindow Integration", () => {
 
     // 2. Open converter panel and select PDFConverter
     await userEvent.click(screen.getByTestId("toggle-converter-panel-btn"));
-    const combobox = screen.getByRole("combobox");
+    const combobox = screen.getByRole("combobox", { name: "Add converter" });
     await userEvent.click(combobox);
     const option = await screen.findByRole("option", { name: /PDFConverter/ });
     await userEvent.click(option);
 
-    // 3. text→file converters do not auto-preview; click Preview explicitly
+    // 3. Convert the text-to-file converter explicitly.
     await waitFor(() => {
       expect(screen.getByTestId("converter-preview-btn")).toBeInTheDocument();
     });
@@ -5391,23 +5786,22 @@ describe("ChatWindow Integration", () => {
   });
 
   it("should auto-clear a stale text→text conversion when the typed text diverges from the original", async () => {
-    mockedConvertersApi.listConverterCatalog.mockResolvedValue({
-      items: [
-        {
-          converter_type: "Base64Converter",
-          supported_input_types: ["text"],
-          supported_output_types: ["text"],
-          parameters: [],
-        },
-      ],
-    });
-    mockedConvertersApi.createConverter.mockResolvedValue({
-      converter_id: "conv-b64-stale",
-      converter_type: "Base64Converter",
+    mockedConvertersApi.listConverters.mockResolvedValue({
+      items: [makeConverterInstance("conv-b64-stale", "Base64Converter")],
     });
     mockedConvertersApi.previewConversion.mockResolvedValue({
+      original_value: "hello",
+      original_value_data_type: "text",
       converted_value: "aGVsbG8=",
       converted_value_data_type: "text",
+      steps: [{
+        converter_id: "conv-b64-stale",
+        converter_type: "Base64Converter",
+        input_value: "hello",
+        input_data_type: "text",
+        output_value: "aGVsbG8=",
+        output_data_type: "text",
+      }],
     });
 
     render(
@@ -5420,7 +5814,7 @@ describe("ChatWindow Integration", () => {
     await userEvent.type(chatInput, "hello");
 
     await userEvent.click(screen.getByTestId("toggle-converter-panel-btn"));
-    const combobox = screen.getByRole("combobox");
+    const combobox = screen.getByRole("combobox", { name: "Add converter" });
     await userEvent.click(combobox);
     const option = await screen.findByRole("option", { name: /Base64Converter/ });
     await userEvent.click(option);

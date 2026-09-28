@@ -13,6 +13,12 @@ Your choice is saved in this browser. System follows the operating system's
 light/dark preference. High-contrast mode overrides every palette and hides
 decorations without forgetting the selected preset.
 
+## Resuming a scenario run
+
+Failed runs offer **Resume run** on the run page and **Resume** in Scanner History.
+See the [GUI guide](../doc/gui/0_gui.md#resuming-a-failed-scanner-run) for resume
+behavior and the saved launch configuration requirement.
+
 ## Development
 
 ```bash
@@ -74,6 +80,24 @@ pyrit_backend --host 127.0.0.1 --port 8080
 
 **Production Mode**: When installed from PyPI, the backend serves the bundled frontend and will exit if frontend files are missing.
 
+## Chat converters
+
+Chat keeps one ordered converter pipeline per input modality in memory. Closing
+the converter panel does not clear these pipelines. Sending a message clears
+its conversion results, but keeps the pipelines for the next message.
+Use the arrow keys on a stage's reorder button to move it. Focus stays on that
+stage, including when the same converter occurs more than once.
+
+**Convert** processes each input piece separately, including multiple attachments
+of the same type. **Add converted value** replaces the applied selection with the
+current successful results. Failed pieces remain unconverted and show an error.
+Changing an input or its pipeline clears the affected results and selections;
+late responses cannot restore them.
+
+Send uses the applied pieces' exact message indexes and runs their configured
+converters on the backend. A nondeterministic converter can produce a different
+value at Send than the value shown in the converter panel.
+
 ## Stack
 
 - **React 18** - UI framework
@@ -131,6 +155,11 @@ E2E tests use `dev.py` to automatically start both frontend and backend servers.
 
 The frontend proxies API requests to `http://localhost:8000` in development.
 Configure this in `vite.config.ts` if needed.
+
+The Vite development server disables its own CORS handling. Use the frontend's
+same-origin `/api` proxy for API requests. Cross-origin API preflights pass to
+the backend, which applies its configured origin policy. Do not enable
+unrestricted Vite CORS: it can bypass the backend's preflight checks.
 
 ## Adding a theme preset
 

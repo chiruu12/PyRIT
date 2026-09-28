@@ -30,6 +30,8 @@ export interface ThemeContextValue {
 }
 
 export interface MessageAttachment {
+  /** Client-side identity of one attachment in the editable draft. */
+  draftId?: string
   type: 'image' | 'audio' | 'video' | 'file'
   name: string
   url: string
@@ -49,6 +51,59 @@ export interface MessageAttachment {
   pieceId?: string
   /** Backend prompt_metadata — preserved so video_id etc. carry over on remix/copy */
   metadata?: Record<string, unknown>
+}
+
+export interface ConverterInputPiece {
+  id: string
+  pieceType: string
+  name: string
+  dataType: string
+  value: string
+  file?: File
+}
+
+export interface PieceConversion {
+  pieceId: string
+  pieceType: string
+  converterInstanceIds: string[]
+  convertedValue: string
+  originalValue: string
+  convertedDataType: string
+}
+
+export interface ConverterPipelineStage {
+  readonly id: string
+  readonly converterId: string
+}
+
+export interface ConverterStageResult {
+  readonly stageId: string
+  readonly generated: ConverterPreviewStep
+  value: string
+}
+
+export interface ChatConverterController {
+  readonly editRevision: number
+  inputs: ConverterInputPiece[]
+  workingInputs: Record<string, string>
+  pipelines: Record<string, ConverterPipelineStage[]>
+  stageResults: Record<string, ConverterStageResult[]>
+  results: Record<string, ConverterPreviewResponse>
+  errors: Record<string, string>
+  applied: Record<string, PieceConversion>
+  isConverting: boolean
+  addConverter: (pieceType: string, converterId: string) => void
+  setPipeline: (pieceType: string, update: (stages: ConverterPipelineStage[]) => ConverterPipelineStage[]) => void
+  retainConverters: (availableIds: Set<string>) => void
+  convert: (pieceType: string) => Promise<void>
+  convertRemaining: (pieceId: string, stageId: string) => Promise<void>
+  editInput: (pieceId: string, value: string) => void
+  editStageOutput: (pieceId: string, stageId: string, value: string) => void
+  apply: () => void
+  clear: (pieceId: string) => void
+  clearAll: () => void
+  editConvertedValue: (pieceId: string, value: string) => void
+  restore: (text: string, attachments: MessageAttachment[], conversions: Record<string, PieceConversion>) => void
 }
 
 export interface MessageTextDisplayPiece {
@@ -127,6 +182,7 @@ export interface ConfigurationFileContent {
   content: string
   source: string
   version: string
+  live_reinitialization_enabled: boolean
 }
 
 export interface UpdateConfigurationFileRequest {
@@ -159,6 +215,23 @@ export interface EnvironmentFileListResponse {
 }
 
 // --- Targets ---
+
+export interface TargetReference {
+  readonly registryName: string
+  readonly identifierHash: string
+}
+
+export interface TargetPreferences {
+  readonly objective: TargetReference | null
+  readonly adversarial: TargetReference | null
+}
+
+export interface UserPreferences {
+  readonly targets: TargetPreferences
+  readonly labels: Record<string, string | null>
+  readonly theme: ThemeMode
+  readonly chatMarkdown: boolean
+}
 
 export interface TargetCapabilities {
   supports_multi_turn: boolean
@@ -278,7 +351,7 @@ export interface ConverterListResponse {
 }
 
 export interface CreateConverterRequest {
-  name?: string
+  name: string
   type: string
   params?: Record<string, unknown>
 }
@@ -291,6 +364,8 @@ export interface Parameter {
   default?: string | string[] | null
   choices?: string[] | null
   is_list?: boolean
+  /** Structured input variants mapped to their constructor parameters. */
+  variants?: Record<string, Parameter[]> | null
   reference_type?: 'target' | 'converter' | 'scorer' | 'scenario' | null
   description?: string | null
 }
@@ -308,19 +383,38 @@ export interface ConverterTypeListResponse {
   items: ConverterTypeEntry[]
 }
 
-/** Temporary compatibility names used by the existing chat converter panel. */
-export type ConverterCatalogEntry = ConverterTypeEntry
-export type ConverterCatalogResponse = ConverterTypeListResponse
+export interface ConverterPreviewRequest {
+  original_value: string
+  converter_ids: string[]
+  original_value_data_type?: string
+}
 
-export interface TargetCatalogEntry {
+/** One converter stage of a `/converters/preview` pipeline run. */
+export interface ConverterPreviewStep {  converter_id: string
+  converter_type: string
+  input_value: string
+  input_data_type: string
+  output_value: string
+  output_data_type: string
+}
+
+export interface ConverterPreviewResponse {
+  original_value: string
+  original_value_data_type: string
+  converted_value: string
+  converted_value_data_type: string
+  steps: ConverterPreviewStep[]
+}
+
+export interface TargetTypeEntry {
   target_type: string
   parameters: Parameter[]
   supported_auth_modes: ('api_key' | 'identity')[]
   description?: string | null
 }
 
-export interface TargetCatalogResponse {
-  items: TargetCatalogEntry[]
+export interface TargetTypeListResponse {
+  items: TargetTypeEntry[]
 }
 
 // --- Attacks ---
@@ -486,6 +580,8 @@ export interface MessagePieceRequest {
   data_type: string // 'text' | 'image_path' | 'audio_path' | 'video_path' | 'binary_path'
   original_value: string
   converted_value?: string
+  converted_value_data_type?: string
+  applied_converter_ids?: string[]
   mime_type?: string
   original_prompt_id?: string
   prompt_metadata?: Record<string, unknown>
@@ -496,12 +592,25 @@ export interface PrependedMessageRequest {
   pieces: MessagePieceRequest[]
 }
 
+/**
+ * Ordered converter stack applied to specific pieces of a message.
+ * `indexes_to_apply` targets exact piece indexes; `prompt_data_types_to_apply`
+ * targets every piece of the listed data types.
+ */
+export interface ConverterConfigurationRequest {
+  converter_ids: string[]
+  indexes_to_apply?: number[]
+  prompt_data_types_to_apply?: string[]
+}
+
 export interface AddMessageRequest {
   role: string
   pieces: MessagePieceRequest[]
   send: boolean
   target_registry_name?: string
   converter_ids?: string[]
+  request_converter_configurations?: ConverterConfigurationRequest[]
+  response_converter_configurations?: ConverterConfigurationRequest[]
   target_conversation_id: string
 }
 
@@ -570,6 +679,7 @@ export interface RegisteredScenario {
   default_datasets: string[]
   baseline_policy: 'enabled' | 'disabled' | 'forbidden'
   include_baseline_by_default: boolean
+  uses_default_adversarial_target: boolean
   supported_parameters: Parameter[]
   default_run_size: ScenarioRunSizeEstimateResponse
 }
@@ -588,6 +698,7 @@ export interface ListRegisteredScenariosResponse {
 export interface RunScenarioRequest {
   scenario_name: string
   target_name: string
+  adversarial_target_name?: string | null
   initializers?: string[] | null
   techniques?: string[] | null
   dataset_names?: string[] | null
@@ -637,6 +748,7 @@ export interface ScenarioRunSizeEstimateResponse {
 
 export interface ScenarioRunSizeEstimateRequest {
   target_name?: string | null
+  adversarial_target_name?: string | null
   techniques?: string[] | null
   dataset_names?: string[] | null
   max_dataset_size?: number | null
@@ -739,6 +851,7 @@ export interface RetryEvent {
   component_role: string
   component_name?: string | null
   endpoint?: string | null
+  status_code?: number | null
   elapsed_seconds: number
 }
 
@@ -750,6 +863,15 @@ export interface AttackRetrySummary {
 
 export type ScenarioRunState = 'CREATED' | 'QUEUED' | 'IN_PROGRESS' | 'COMPLETED' | 'FAILED' | 'CANCELLED'
 
+export interface ScenarioOverloadSummary {
+  component_role: string
+  count: number
+  rate_limit_count: number
+  server_error_count: number
+  status_codes: number[]
+  latest_timestamp: string
+}
+
 export interface ScenarioRunSummary {
   scenario_result_id: string
   scenario_name: string
@@ -757,6 +879,7 @@ export interface ScenarioRunSummary {
   scenario_version: number
   status: ScenarioRunState
   created_at: string
+  started_at?: string | null
   updated_at: string
   error?: string | null
   error_type?: string | null
@@ -777,6 +900,9 @@ export interface ScenarioRunSummary {
   successful_attacks?: number
   error_attacks?: number
   attack_details_available?: boolean
+  queue_position?: number | null
+  active_scenario_result_id?: string | null
+  overload_summaries?: ScenarioOverloadSummary[]
 }
 
 export interface ScenarioTargetSummary {
@@ -793,6 +919,7 @@ export interface ScenarioRunListItem {
   scenario_version: number
   status: ScenarioRunState
   created_at: string
+  started_at?: string | null
   updated_at: string
   error?: string | null
   error_type?: string | null
@@ -826,13 +953,37 @@ export interface ScenarioProgressHeader {
   scenario_version: number
   status: ScenarioRunState
   created_at: string
+  started_at?: string | null
   completed_at?: string | null
+  error?: string | null
+  error_type?: string | null
   pyrit_version?: string | null
   target?: ScenarioTargetSummary | null
   techniques_used?: string[]
   datasets_used?: string[]
   scenario_parameters?: Record<string, unknown>
   labels?: Record<string, string>
+  queue_position?: number | null
+  active_scenario_result_id?: string | null
+  overload_summaries?: ScenarioOverloadSummary[]
+}
+
+export interface ScenarioQueueEntry {
+  scenario_result_id: string
+  scenario_name: string
+  scenario_registry_name: string
+  created_at: string
+  enqueued_at: string
+  started_at?: string | null
+  state: ScenarioRunState
+  position?: number | null
+}
+
+export interface ScenarioQueueSnapshot {
+  revision: number
+  snapshot_at: string
+  active?: ScenarioQueueEntry | null
+  queued: ScenarioQueueEntry[]
 }
 
 /** One persisted attack attempt in ascending progress order. */
@@ -980,4 +1131,19 @@ export interface ScenarioRunProgress {
   next_cursor?: string | null
   has_more: boolean
   plan_complete: boolean
+}
+export interface RuntimeReadiness {
+  ready: boolean
+  state: string
+  generation: string
+}
+
+export interface RuntimeStatus {
+  state: string
+  generation: string
+  version: string | null
+  enabled: boolean
+  applying: boolean
+  outcome: string
+  message: string
 }

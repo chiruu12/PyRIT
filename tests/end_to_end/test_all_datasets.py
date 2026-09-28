@@ -88,10 +88,10 @@ _HF_GATED_PROVIDERS: set[type] = {
 }
 
 
-def get_dataset_providers():
-    """Helper to get all registered providers for parameterization."""
-    providers = SeedDatasetProvider.get_all_providers()
-    return [(name, cls) for name, cls in providers.items()]
+def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
+    """Materialize the full registry only when collecting the default-provider sweep."""
+    if "provider_cls" in metafunc.fixturenames:
+        metafunc.parametrize("name,provider_cls", list(SeedDatasetProvider.get_all_providers().items()))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -302,7 +302,6 @@ class TestAllDatasets:
     """Exhaustive test that every registered dataset provider can be fetched."""
 
     @pytest.mark.timeout(_TEST_TIMEOUT)
-    @pytest.mark.parametrize("name,provider_cls", get_dataset_providers())
     async def test_fetch_dataset(self, name, provider_cls):
         """
         Verify that a specific registered dataset can be fetched.

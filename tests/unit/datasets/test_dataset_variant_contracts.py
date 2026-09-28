@@ -2,10 +2,12 @@
 # Licensed under the MIT license.
 
 import asyncio
+import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -16,6 +18,45 @@ _LANGUAGE_TEXT = {
     "zh": "\u8bf7\u63cf\u8ff0\u56fe\u7247\u4e2d\u7684\u573a\u666f\u3002",
     "vi": "H\u00e3y m\u00f4 t\u1ea3 c\u1ea3nh trong \u1ea3nh.",
 }
+
+
+def test_variant_module_load_does_not_materialize_provider_registry() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path\n"
+                "from runpy import run_path\n"
+                "from unittest.mock import patch\n"
+                "from pyrit.datasets import SeedDatasetProvider\n"
+                "with patch.object(SeedDatasetProvider, 'get_all_providers', "
+                "side_effect=AssertionError('registry materialized during import')):\n"
+                "    run_path(str(Path('tests') / 'end_to_end' / 'test_all_datasets.py'))\n"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[3],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("fixturenames", [["case_id"], ["name", "provider_cls"]])
+def test_provider_registry_is_materialized_only_for_default_sweep(fixturenames: list[str]) -> None:
+    metafunc = MagicMock(spec=pytest.Metafunc)
+    metafunc.fixturenames = fixturenames
+    providers = {"aya": dataset_tests._AyaRedteamingDataset, "catqa": dataset_tests._CategoricalHarmfulQADataset}
+    with patch.object(dataset_tests.SeedDatasetProvider, "get_all_providers", return_value=providers) as get_providers:
+        dataset_tests.pytest_generate_tests(metafunc)
+        if "provider_cls" in fixturenames:
+            get_providers.assert_called_once()
+            assert metafunc.parametrize.call_args.args == ("name,provider_cls", list(providers.items()))
+        else:
+            get_providers.assert_not_called()
+            metafunc.parametrize.assert_not_called()
 
 
 @pytest.mark.parametrize("language", ["zh", "vi"])
